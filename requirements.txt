@@ -1,0 +1,6 @@
+PyQt5
+opencv-python-headless
+numpy
+pyaudio
+mss
+Pillow
