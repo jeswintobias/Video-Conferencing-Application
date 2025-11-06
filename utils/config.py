@@ -9,7 +9,7 @@ VIDEO_PORT = 5000
 AUDIO_PORT = 5001
 CHAT_PORT = 5002
 FILE_PORT = 5003
-SCREEN_PORT = 5005 # Final screen sharing port
+SCREEN_PORT = 5005
 
 # --- Network Configuration ---
 MAX_PACKET_SIZE = 65507  # Max safe UDP packet size

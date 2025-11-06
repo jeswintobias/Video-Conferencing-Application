@@ -1,4 +1,3 @@
-# client/audio_client.py
 """
 Audio Client - Definitive stable version for Windows.
 - Robust shutdown sequence to prevent crashes.
@@ -17,6 +16,29 @@ sys.path.append('..')
 from utils.config import *
 
 class AudioClient:
+    """
+    Audio streaming client over UDP.
+
+    Responsibilities
+    - Capture microphone PCM frames and send to server (type=2 packets)
+    - Receive mixed audio from server and play to speakers
+    - Maintain connectivity via HELLO (255) and HEARTBEAT (254) packets
+
+    Threads
+    - _receive_audio: reads UDP packets and enqueues for playback
+    - _playback_audio: dequeues and writes to an output PyAudio stream
+    - _send_heartbeat: low-frequency keepalive when not actively sending mic
+    - _send_audio: (started on demand) captures mic and sends frames
+
+    Packet formats
+    - HELLO:    [1:255][4:client_id]
+    - HEARTBEAT:[1:254][4:client_id]
+    - AUDIO:    [1:2][4:client_id][4:seq] + raw PCM int16 mono frames
+
+    Clean shutdown contract
+    - Set self.running=False then stop_microphone/stop_speakers
+    - Close socket and terminate PyAudio at the very end
+    """
     def __init__(self, client_id, server_ip):
         self.client_id = client_id
         self.server_ip = server_ip
@@ -35,6 +57,10 @@ class AudioClient:
         self.packets_received = 0
 
     def connect(self):
+        """Initialize audio backend, UDP socket, start background threads and announce to server.
+
+        Returns True on success, False on failure without raising.
+        """
         try:
             self._audio_interface = pyaudio.PyAudio() # Initialize PyAudio here
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -60,6 +86,11 @@ class AudioClient:
             return False
 
     def start_microphone(self, input_device_index=None):
+        """Begin capturing microphone audio and start the sender thread.
+
+        input_device_index: optional PyAudio device index to force a device.
+        Returns True if already sending or started successfully; False on failure.
+        """
         if self.sending or not self.running: return True
         try:
             # Ensure audio interface exists
@@ -81,6 +112,7 @@ class AudioClient:
             return False
 
     def stop_microphone(self):
+        """Stop capturing microphone audio and close the input stream safely."""
         if not self.sending: return
         self.sending = False # Signal send thread to stop
         # Let the send thread finish naturally, don't join here
@@ -104,6 +136,11 @@ class AudioClient:
         print("[AUDIO CLIENT] Microphone stopped")
 
     def start_speakers(self, output_device_index=None):
+        """Open the output audio device so the playback thread can write frames.
+
+        output_device_index: optional PyAudio device index to force a device.
+        Returns True if already receiving or started successfully; False on failure.
+        """
         if self.receiving or not self.running: return True
         try:
             if not self._audio_interface: self._audio_interface = pyaudio.PyAudio()
@@ -121,6 +158,7 @@ class AudioClient:
             return False
 
     def stop_speakers(self):
+        """Stop writing to speakers and close the output stream safely."""
         if not self.receiving: return
         self.receiving = False # Signal playback thread
 
@@ -143,6 +181,7 @@ class AudioClient:
         print("[AUDIO CLIENT] Speakers stopped")
 
     def _send_hello_packet(self):
+        """Send a short HELLO burst so the server learns our latest UDP address."""
         try:
             packet = struct.pack('!BI', 255, self.client_id)
             for _ in range(3):
@@ -153,6 +192,7 @@ class AudioClient:
             if self.running: print(f"[AUDIO CLIENT ERROR] Failed to send HELLO packet: {e}")
 
     def _send_heartbeat(self):
+        """Periodic low-bandwidth keepalive when mic is idle, to keep NAT/state fresh."""
         while self.running:
             try:
                 time.sleep(10)
@@ -163,6 +203,7 @@ class AudioClient:
                 if self.running: print(f"[AUDIO CLIENT ERROR] Heartbeat failed: {e}")
 
     def _send_audio(self):
+        """Producer loop: read PCM frames from input stream and send as type=2 packets."""
         while self.running and self.sending:
             try:
                 stream = self.input_stream # Use local variable for safety
@@ -198,6 +239,7 @@ class AudioClient:
 
 
     def _receive_audio(self):
+        """Consumer ingress: receive UDP audio packets and enqueue validated frames."""
         while self.running:
             try:
                 data, _ = self.sock.recvfrom(MAX_PACKET_SIZE)
@@ -217,49 +259,76 @@ class AudioClient:
             except Exception as e:
                 if self.running: print(f"[AUDIO CLIENT ERROR] Receive error: {e}")
 
-    # --- UPDATED PLAYBACK FUNCTION ---
+    # --- UPDATED PLAYBACK FUNCTION (WITH AUTO-RECOVERY) ---
     def _playback_audio(self):
-        """Plays audio; includes refined safety checks for shutdown."""
+        """
+        Plays audio from the queue.
+        [FIX] Includes robust auto-recovery logic to handle
+        host device errors (like -9999) by restarting the stream.
+        """
         silence = np.zeros(AUDIO_CHUNK * AUDIO_CHANNELS, dtype=np.int16).tobytes()
+        
         while self.running:
-            stream = self.output_stream # Use local variable for safety
-            
-            # Check primary conditions first
-            if not self.running or not self.receiving or not stream:
-                time.sleep(0.02) # Wait briefly if not ready or stopped
+            # If receiving is false, we are not supposed to be playing.
+            # This is the "off" state, controlled by start/stop_speakers().
+            if not self.receiving:
+                time.sleep(0.05)
                 continue
 
+            # If we are supposed to be receiving, but the stream is dead
+            # (e.g., after an error), try to restart it.
+            if not self.output_stream:
+                print("[AUDIO CLIENT INFO] Output stream is down. Attempting to restart...")
+                # Try to call the main start_speakers() method
+                if not self.start_speakers():
+                    # If start_speakers() fails, stop trying so we don't spam.
+                    print("[AUDIO CLIENT ERROR] Failed to restart output stream. Stopping playback.")
+                    # Set receiving to False to go back to the "off" state.
+                    self.receiving = False 
+                    time.sleep(1) # Wait a bit before next loop
+                continue # Go back to the top of the loop to re-check state
+            
+            # --- If we get here, self.receiving is True AND self.output_stream exists ---
+            stream = self.output_stream # Use local variable for safety
+
             try:
-                # --- ROBUST STREAM CHECK ---
-                # Check if stream is active *inside* the loop and try-except
+                # Check if stream is valid and active before writing
                 if not stream.is_active():
-                    # Stream might have been stopped by another thread
+                    print("[AUDIO CLIENT DEBUG] Stream not active, skipping write.")
                     time.sleep(0.02)
                     continue
-                # --- END ROBUST CHECK ---
 
                 try:
+                    # Get data and write to the (valid) stream
                     audio_data = self.playback_queue.get(timeout=0.02)
                     stream.write(audio_data)
                 except Empty:
-                    # Write silence only if the stream is still active
+                    # Queue is empty, write silence
                     if stream.is_active():
                         stream.write(silence)
                 
             except (OSError, IOError, AttributeError) as e:
-                # Catch errors related to stream state (closed, invalid, etc.)
-                # This includes the "Stream not open" error
-                if self.running: # Avoid printing errors during intentional shutdown
-                     print(f"[AUDIO CLIENT ERROR] Playback stream error: {e}")
-                # Assume the stream is bad, stop trying to receive/play
-                self.receiving = False 
-                # Attempt to close the faulty stream instance if it still exists locally
-                if stream: 
+                # --- THIS IS THE ERROR HANDLER ---
+                # This block now catches the -9999 error
+                if self.running: 
+                     print(f"[AUDIO CLIENT ERROR] Playback stream error: {e}. Cleaning up for auto-recovery.")
+                
+                # The stream is dead. Clean it up fully.
+                if stream:
+                    try:
+                        stream.stop_stream()
+                    except: pass
                     try:
                         stream.close()
-                    except: pass 
-                self.output_stream = None # Ensure the main reference is cleared
-                time.sleep(0.1) # Wait a bit before potentially restarting
+                    except: pass
+                
+                # CRITICAL: Set the class-level stream to None.
+                # DO NOT set self.receiving = False.
+                # By setting this to None, the logic at the top of the
+                # loop will trigger and try to restart the stream.
+                self.output_stream = None 
+                
+                time.sleep(0.5) # Give the audio device a moment to settle
                 
             except Exception as e:
                 # Catch any other unexpected errors
@@ -267,7 +336,7 @@ class AudioClient:
                      print(f"[AUDIO CLIENT ERROR] Unexpected playback error: {e}")
                  time.sleep(0.1)
 
-        print("[AUDIO CLIENT DEBUG] Playback thread finished.") # Debug message
+        print("[AUDIO CLIENT DEBUG] Playback thread finished.")
     # --- END UPDATED PLAYBACK FUNCTION ---
 
     def _cleanup_audio_interface(self):
@@ -280,19 +349,15 @@ class AudioClient:
             self._audio_interface = None
 
     def disconnect(self):
+        """Gracefully stop threads, close streams/sockets, and release PyAudio."""
         print("[AUDIO CLIENT] Disconnecting...")
         if not self.running: return
-        self.running = False # Signal all threads to stop FIRST
-
-        # Close streams immediately using the stop methods
+        self.running = False 
         self.stop_microphone()
         self.stop_speakers()
-
-        # Close the socket to interrupt blocking calls in threads like recvfrom
         sock = self.sock
         self.sock = None
         if sock:
-            # Closing the socket is generally enough for UDP
             try:
                 sock.close()
             except Exception as e:

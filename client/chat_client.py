@@ -197,8 +197,8 @@ class ChatClient:
             # Includes ConnectionResetError, ConnectionAbortedError
             return None # Treat timeout/errors as connection failure for recv
 
-    def send_message(self, text):
-        """Send a text message to the server."""
+    def send_message(self, text, recipient_id=None):
+        """Send a text message to the server. If recipient_id is provided, sends as private message."""
         if not self.connected or not self.sock:
             print("[CHAT CLIENT] Cannot send: Not connected")
             return False
@@ -207,6 +207,10 @@ class ChatClient:
 
         try:
             message = {'text': text[:512]} # Limit outgoing message size
+            # Add recipient_id if this is a private message
+            if recipient_id is not None:
+                message['recipient_id'] = recipient_id
+                message['is_private'] = True
             msg_json = json.dumps(message).encode('utf-8')
             msg_packet = struct.pack('!I', len(msg_json)) + msg_json
             self.sock.sendall(msg_packet)
@@ -218,6 +222,26 @@ class ChatClient:
             return False
         except Exception as e:
             print(f"[CHAT CLIENT ERROR] Send failed: {e}")
+            return False
+
+    def send_reaction(self, emoji):
+        """Send a reaction emoji to the server."""
+        if not self.connected or not self.sock:
+            print("[CHAT CLIENT] Cannot send reaction: Not connected")
+            return False
+
+        try:
+            message = {'type': 'reaction', 'emoji': emoji}
+            msg_json = json.dumps(message).encode('utf-8')
+            msg_packet = struct.pack('!I', len(msg_json)) + msg_json
+            self.sock.sendall(msg_packet)
+            return True
+        except (OSError, ConnectionError) as e:
+            print(f"[CHAT CLIENT ERROR] Send reaction failed (connection lost): {e}")
+            self.disconnect()
+            return False
+        except Exception as e:
+            print(f"[CHAT CLIENT ERROR] Send reaction failed: {e}")
             return False
 
     def register_callback(self, callback):

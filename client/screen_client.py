@@ -13,19 +13,15 @@ import cv2
 import numpy as np
 import sys
 import os
-import zlib # Using zlib for compression instead of JPEG for speed
-import traceback # <--- IMPORT TRACEBACK
-from mss import mss # <--- Windows-specific high-speed library
-
+import zlib
+import traceback
+from mss import mss 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.config import *
 
-# Fallback defaults for optional config values
 if "SCREEN_QUALITY" not in globals():
     SCREEN_QUALITY = 80  # JPEG quality (0-100)
 
-# Provide fallback for SCREEN_SHARE_RES used for capture (width, height)
-# Default to 1280x720 (HD) if not defined in the imported config.
 if "SCREEN_SHARE_RES" not in globals():
     SCREEN_SHARE_RES = (1280, 720)
 

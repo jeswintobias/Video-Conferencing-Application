@@ -1,9 +1,9 @@
 """
 File Server - Manages file transfers between clients using TCP.
-[FIXED] Added PING/PONG heartbeat response
-[FIXED] Ensures file list is sent only explicitly or after upload notification.
+[FIX] Added PING/PONG heartbeat response to fix client disconnects.
 [FIX] Broadcast notification now sends to *all* clients, including uploader.
-[CLEANUP] Removed redundant OS-level TCP Keepalives
+[FIX] Fixed Upload ACK to be 2 bytes (0x01 + 0x01/0x00)
+[FIX] Fixed Download header to include 0x02 type byte
 """
 import socket
 import threading
@@ -55,7 +55,6 @@ class FileServer:
         while self.running:
             try:
                 client_sock, client_addr = self.sock.accept()
-                # Removed redundant SO_KEEPALIVE options
                 handler_thread = threading.Thread(target=self._handle_client, args=(client_sock, client_addr), daemon=True)
                 handler_thread.start()
             except OSError:
@@ -92,9 +91,9 @@ class FileServer:
             print(f"[FILE SERVER] Client {client_id} ({username}) connected from {client_addr}")
 
             if not self._send_ack(client_sock, client_id): return
-            if not self._send_file_list(client_sock): return
+            if not self._send_file_list(client_sock, client_id): return
 
-            client_sock.settimeout(CONNECTION_TIMEOUT + 15.0)
+            client_sock.settimeout(CONNECTION_TIMEOUT + 15.0) 
 
             while self.running:
                 with self.client_lock:
@@ -119,18 +118,16 @@ class FileServer:
                     self._send_file_list(client_sock)
                     client_sock.settimeout(CONNECTION_TIMEOUT + 15.0) # Restore
                 
-                # --- THIS IS THE CRITICAL FIX ---
                 elif req_type == 5: # PING
                     try:
                         client_sock.sendall(b'\x06') # PONG
                     except Exception as e:
                         print(f"[FILE SERVER WARN] Failed to send PONG to {client_id}: {e}")
-                        break # Connection is likely broken
-                # --- END FIX ---
+                        break
                 
                 else:
                     print(f"[FILE SERVER WARN] Client {client_id} sent unknown request type: {req_type}")
-                    time.sleep(0.1) # Prevent spamming
+                    time.sleep(0.1)
 
         except (socket.timeout, ConnectionError, OSError) as e:
             if self.running and client_added:
@@ -177,7 +174,8 @@ class FileServer:
 
             if meta_len == 0 or meta_len > 4096:
                 print(f"[FILE SERVER WARN] Client {client_id} sent invalid metadata length: {meta_len}")
-                client_sock.sendall(b'\x00') # Send failure
+                # [MODIFIED] Send new failure ACK: Type 1, Length 0
+                client_sock.sendall(b'\x01' + struct.pack('!I', 0))
                 return
 
             meta_data = self._recv_exact(client_sock, meta_len)
@@ -187,10 +185,13 @@ class FileServer:
             filename = metadata.get('filename')
             filesize = metadata.get('filesize')
             client_hash = metadata.get('hash')
+            recipient_id = metadata.get('recipient_id')
+            is_private = metadata.get('is_private', False) or (recipient_id is not None)
 
             if not filename or not isinstance(filesize, int) or filesize < 0:
                 print(f"[FILE SERVER WARN] Client {client_id} sent invalid metadata content: {metadata}")
-                client_sock.sendall(b'\x00')
+                # [MODIFIED] Send new failure ACK: Type 1, Length 0
+                client_sock.sendall(b'\x01' + struct.pack('!I', 0))
                 return
 
             upload_timeout = 60.0 + (filesize / 50000) if filesize > 0 else 60.0
@@ -218,7 +219,8 @@ class FileServer:
                         bytes_received += len(chunk)
             except IOError as e:
                 print(f"[FILE SERVER ERROR] Cannot write file {file_path}: {e}")
-                client_sock.sendall(b'\x00')
+                # [MODIFIED] Send new failure ACK: Type 1, Length 0
+                client_sock.sendall(b'\x01' + struct.pack('!I', 0))
                 if os.path.exists(file_path): os.remove(file_path)
                 return
 
@@ -232,19 +234,37 @@ class FileServer:
                 'hash': server_hash_hex, 'uploader': username, 'uploader_id': client_id,
                 'timestamp': datetime.now().isoformat(), 'path': file_path
             }
+            
+            # Add private file fields if it's a private file
+            if is_private and recipient_id is not None:
+                file_info_to_store['is_private'] = True
+                file_info_to_store['recipient_id'] = recipient_id
+                print(f"[FILE SERVER] Private file '{filename}' from {username} to client {recipient_id}")
+            else:
+                print(f"[FILE SERVER] Public file '{filename}' from {username}")
+            
             with self.file_lock:
                 self.files[file_id] = file_info_to_store
                 self.total_files_ever += 1
                 self.total_bytes_stored += filesize
 
-            print(f"[FILE SERVER] File '{filename}' saved as {file_id}")
-            client_sock.settimeout(5.0)
-            client_sock.sendall(b'\x01') # Send success
-
-            # --- Broadcast notification AFTER sending success ---
+            print(f"[FILE SERVER] File '{filename}' saved as {file_id}. Sending ACK to uploader.")
+            
+            # --- [MODIFICATION] ---
+            # Send the full file_info dict as the success ACK
+            try:
+                file_info_serializable = {k: v for k, v in file_info_to_store.items() if k != 'path'}
+                ack_json = json.dumps(file_info_serializable).encode('utf-8')
+                
+                # Send 1-byte TYPE (0x01) + 4-byte LENGTH + JSON
+                client_sock.sendall(b'\x01' + struct.pack('!I', len(ack_json)) + ack_json)
+            except Exception as e:
+                print(f"[FILE SERVER ERROR] Failed to send JSON ACK: {e}")
+                # Send a failure ACK if JSON fails
+                client_sock.sendall(b'\x01' + struct.pack('!I', 0)) # Type 1, Length 0 = Fail
+                return
             threading.Thread(target=self._broadcast_file_notification,
-                             # --- FIX: Pass None to notify ALL clients (including uploader) ---
-                             args=(file_info_to_store.copy(), None),
+                             args=(file_info_to_store.copy(), client_id), # Pass client_id for private handling
                              daemon=True).start()
 
         except (socket.timeout, ConnectionError, OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -255,7 +275,8 @@ class FileServer:
             try:
                 if client_sock and client_sock.fileno() != -1:
                         client_sock.settimeout(2.0)
-                        client_sock.sendall(b'\x00')
+                        # [MODIFIED] Send new failure ACK: Type 1, Length 0
+                        client_sock.sendall(b'\x01' + struct.pack('!I', 0))
             except: pass
         except Exception as e:
             print(f"[FILE SERVER ERROR] Unexpected upload error from {client_id}: {e}")
@@ -266,14 +287,14 @@ class FileServer:
             try:
                 if client_sock and client_sock.fileno() != -1:
                     client_sock.settimeout(2.0)
-                    client_sock.sendall(b'\x00')
+                    # [MODIFIED] Send new failure ACK: Type 1, Length 0
+                    client_sock.sendall(b'\x01' + struct.pack('!I', 0))
             except: pass
         finally:
              try:
                 if client_sock and client_sock.fileno() != -1:
                         client_sock.settimeout(original_timeout)
              except: pass
-
 
     def _handle_download(self, client_sock, client_id, username):
         file_path = None
@@ -287,7 +308,8 @@ class FileServer:
 
             if id_len == 0 or id_len > 256:
                 print(f"[FILE SERVER WARN] Client {client_id} sent invalid file ID length: {id_len}")
-                client_sock.sendall(struct.pack('!I', 0))
+                # [CRITICAL FIX - DOWNLOAD] Send 1-byte TYPE (0x02) + 4-byte SIZE (0)
+                client_sock.sendall(b'\x02' + struct.pack('!I', 0))
                 return
 
             file_id = self._recv_exact(client_sock, id_len).decode('utf-8')
@@ -298,7 +320,8 @@ class FileServer:
             file_path_from_info = file_info.get('path', '') if file_info else ''
             if not file_info or not file_path_from_info or not os.path.exists(file_path_from_info):
                 print(f"[FILE SERVER INFO] File not found or path invalid for ID: {file_id}, requested by {client_id}")
-                client_sock.sendall(struct.pack('!I', 0))
+                # [CRITICAL FIX - DOWNLOAD] Send 1-byte TYPE (0x02) + 4-byte SIZE (0)
+                client_sock.sendall(b'\x02' + struct.pack('!I', 0))
                 return
 
             file_path = file_path_from_info
@@ -310,7 +333,8 @@ class FileServer:
             download_timeout = 60.0 + (filesize / 50000) if filesize > 0 else 60.0
             client_sock.settimeout(download_timeout)
 
-            client_sock.sendall(struct.pack('!I', filesize))
+            # [CRITICAL FIX - DOWNLOAD] Send 1-byte TYPE (0x02) + 4-byte SIZE
+            client_sock.sendall(b'\x02' + struct.pack('!I', filesize))
 
             chunk_size_send = 65536
             bytes_sent = 0
@@ -339,54 +363,111 @@ class FileServer:
              except: pass
 
 
-    def _send_file_list(self, client_sock):
+    def _send_file_list(self, client_sock, client_id):
         try:
             with self.file_lock:
-                file_list_serializable = [
-                    {k: v for k, v in info.items() if k != 'path'}
-                    for info in self.files.values()
-                ]
+                # Filter files: show public files to all, private files only to sender/recipient
+                file_list_serializable = []
+                for info in self.files.values():
+                    # Check if file is private
+                    is_private = info.get('is_private', False)
+                    recipient_id = info.get('recipient_id')
+                    uploader_id = info.get('uploader_id')
+                    
+                    # Show file if:
+                    # 1. It's a public file (not private), OR
+                    # 2. It's a private file and client_id is either the sender or recipient
+                    if not is_private or (is_private and (client_id == recipient_id or client_id == uploader_id)):
+                        file_list_serializable.append({k: v for k, v in info.items() if k != 'path'})
+            
             list_json = json.dumps(file_list_serializable).encode('utf-8')
-            client_sock.sendall(struct.pack('!I', len(list_json)) + list_json)
+            # Send 1-byte TYPE (0x03) + 4-byte LENGTH
+            header = b'\x03' + struct.pack('!I', len(list_json))
+            client_sock.sendall(header + list_json)
+            
+            print(f"[FILE SERVER] Sent initial file list ({len(file_list_serializable)} files) to client {client_id}.")
             return True
         except Exception as e:
             print(f"[FILE SERVER ERROR] Failed to send file list: {e}")
             return False
 
-    def _broadcast_file_notification(self, file_info, exclude_client_id=None):
+    def _broadcast_file_notification(self, file_info, sender_id):
+        """
+        Broadcasts a new file notification. 
+        If private, sends only to recipient and sender. Otherwise broadcasts to all.
+        """
         notification = {
             'type': 'new_file',
             'file_id': file_info['file_id'], 'filename': file_info['filename'],
             'filesize': file_info['filesize'], 'uploader': file_info['uploader'],
             'timestamp': file_info['timestamp']
         }
+        
+        # Add private file fields if it's a private file
+        is_private = file_info.get('is_private', False)
+        recipient_id = file_info.get('recipient_id')
+        if is_private and recipient_id is not None:
+            notification['is_private'] = True
+            notification['recipient_id'] = recipient_id
+            notification['sender_id'] = sender_id
+        
         try:
             notif_json = json.dumps(notification).encode('utf-8')
+            # Send 1-byte TYPE (0x04) + 4-byte LENGTH
             notif_packet = b'\x04' + struct.pack('!I', len(notif_json)) + notif_json
         except Exception as e:
             print(f"[FILE SERVER ERROR] Failed to create notification packet: {e}")
             return
 
-        disconnected_clients = []
-        with self.client_lock:
-            current_clients = list(self.clients.items())
-
-        for cid, info in current_clients:
-            if cid == exclude_client_id: continue
-            try:
-                info['socket'].sendall(notif_packet)
-            except (OSError, ConnectionError):
-                 print(f"[FILE SERVER DEBUG] Failed notification send to {cid} (likely disconnected).")
-                 disconnected_clients.append(cid)
-            except Exception as e:
-                 print(f"[FILE SERVER WARN] Unexpected error sending notification to {cid}: {e}")
-                 disconnected_clients.append(cid)
-
-        if disconnected_clients:
+        # Send notification based on whether it's private or public
+        if is_private and recipient_id is not None:
+            print(f"[FILE SERVER] Sending private file notification for '{file_info['filename']}' to recipient {recipient_id} and sender {sender_id}.")
+            self._send_private_file_notification(notif_packet, recipient_id, sender_id)
+        else:
+            print(f"[FILE SERVER] Broadcasting new file notification for '{file_info['filename']}' to ALL clients.")
+            disconnected_sockets = []
             with self.client_lock:
-                for cid in disconnected_clients:
+                current_clients = list(self.clients.items())
+            
+            for cid, info in current_clients:
+                try:
+                    info['socket'].sendall(notif_packet)
+                except (OSError, ConnectionError):
+                    disconnected_sockets.append(cid)
+            
+            if disconnected_sockets:
+                with self.client_lock:
+                    for cid in disconnected_sockets:
+                        if cid in self.clients:
+                            try: self.clients[cid]['socket'].close()
+                            except: pass
+                            del self.clients[cid]
+    
+    def _send_private_file_notification(self, notif_packet, recipient_id, sender_id):
+        """Sends a private file notification to recipient and sender only."""
+        disconnected_sockets = []
+        with self.client_lock:
+            recipient_info = self.clients.get(recipient_id)
+            sender_info = self.clients.get(sender_id)
+            
+            # Send to recipient
+            if recipient_info:
+                try:
+                    recipient_info['socket'].sendall(notif_packet)
+                except (OSError, ConnectionError):
+                    disconnected_sockets.append(recipient_id)
+            
+            # Send to sender (so they see their own private file notification)
+            if sender_info and sender_id != recipient_id:
+                try:
+                    sender_info['socket'].sendall(notif_packet)
+                except (OSError, ConnectionError):
+                    disconnected_sockets.append(sender_id)
+            
+            # Cleanup disconnected clients
+            if disconnected_sockets:
+                for cid in disconnected_sockets:
                     if cid in self.clients:
-                        print(f"[FILE SERVER INFO] Client {cid} marked disconnected during notification.")
                         try: self.clients[cid]['socket'].close()
                         except: pass
                         del self.clients[cid]

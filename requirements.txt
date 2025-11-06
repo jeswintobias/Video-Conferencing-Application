@@ -4,3 +4,4 @@ numpy
 pyaudio
 mss
 Pillow
+qtawesome

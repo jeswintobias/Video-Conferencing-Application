@@ -7,13 +7,19 @@ Manages video, audio, chat, file, and screen sharing services
 import sys
 import time
 import signal
+import os
+
+# Ensure project root is on sys.path before importing local packages
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from utils.config import *
 from video_server import VideoServer
 from audio_server import AudioServer
 from chat_server import ChatServer
 from file_server import FileServer
 from screen_server import ScreenServer
-sys.path.append('..')
-from utils.config import *
 
 class MainServer:
     def __init__(self):

@@ -15,6 +15,28 @@ sys.path.append('..')
 from utils.config import *
 
 class VideoClient:
+    """
+    Video streaming client over UDP.
+
+    Responsibilities
+    - Capture webcam frames, JPEG-encode, fragment, and send to server
+    - Receive frames from other clients (re-broadcast by server) and keep the latest
+    - Maintain connectivity via HELLO (255) and HEARTBEAT (254) packets
+
+    Threads
+    - _receive_video: continuously assembles incoming frame chunks
+    - _send_heartbeat: low-frequency keepalive when not sending video
+    - _send_video: (on demand) captures and sends frames at VIDEO_FPS
+
+    Packet formats
+    - HELLO: [1:255][4:client_id]
+    - HEARTBEAT: [1:254][4:client_id]
+    - VIDEO CHUNK: [1:1][4:client_id][4:seq][2:chunk_idx][2:total_chunks] + bytes
+
+    Frame lifecycle
+    - get_frames() returns only streams updated within stream_timeout seconds
+    - stale streams are pruned to prevent frozen tiles in the UI
+    """
     def __init__(self, client_id, server_ip):
         self.client_id = client_id
         self.server_ip = server_ip
@@ -40,6 +62,7 @@ class VideoClient:
 
     # ... (The rest of the file is identical to the previous correct version) ...
     def connect(self):
+        """Create a UDP socket, start receiver and heartbeat threads, and announce to server."""
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.settimeout(1.0)
@@ -57,6 +80,10 @@ class VideoClient:
             return False
     
     def start_camera(self, camera_index=0):
+        """Open a camera and spawn the sender thread; returns True on success.
+
+        camera_index: platform-dependent webcam index (0 by default).
+        """
         if self.sending: return True
         try:
             self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW if sys.platform == 'win32' else -1)
@@ -76,6 +103,7 @@ class VideoClient:
             return False
 
     def stop_camera(self):
+        """Stop capture thread and release the camera device."""
         if not self.sending: return
         self.sending = False
         if self.send_thread: self.send_thread.join(timeout=0.5)
@@ -84,6 +112,7 @@ class VideoClient:
         print("[VIDEO CLIENT] Camera stopped")
     
     def _send_hello_packet(self):
+        """Send a HELLO burst so the server learns our UDP endpoint."""
         try:
             packet = struct.pack('!BI', 255, self.client_id)
             for _ in range(3):
@@ -93,6 +122,7 @@ class VideoClient:
             print(f"[VIDEO CLIENT ERROR] Failed to send HELLO packet: {e}")
 
     def _send_heartbeat(self):
+        """Periodic low-bandwidth keepalive when not sending video."""
         while self.running:
             try:
                 time.sleep(10)
@@ -103,6 +133,7 @@ class VideoClient:
                 if self.running: print(f"[VIDEO CLIENT ERROR] Heartbeat failed: {e}")
 
     def _send_video(self):
+        """Capture loop: encode frames as JPEG and transmit in chunked packets."""
         frame_interval = 1.0 / VIDEO_FPS
         while self.running and self.sending:
             start_time = time.time()
@@ -123,6 +154,7 @@ class VideoClient:
                 break
 
     def _send_frame_chunks(self, frame_data):
+        """Fragment a single JPEG frame and send all chunks for current sequence number."""
         total_chunks = (len(frame_data) + CHUNK_SIZE - 1) // CHUNK_SIZE
         for i in range(total_chunks):
             chunk_data = frame_data[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE]
@@ -131,6 +163,7 @@ class VideoClient:
         self.seq_num += 1
 
     def _receive_video(self):
+        """Assemble incoming chunks into frames and update latest frame per sender."""
         frame_buffer = {}
         while self.running:
             try:
@@ -161,6 +194,7 @@ class VideoClient:
                 if self.running: print(f"[VIDEO CLIENT ERROR] Receive error: {e}")
 
     def get_frames(self):
+        """Return a dict of recent frames keyed by client_id and prune stale streams."""
         with self.stream_lock:
             current_time = time.time()
             active_streams = {}
@@ -187,6 +221,7 @@ class VideoClient:
             return active_streams
     
     def disconnect(self):
+        """Gracefully stop threads, release camera, close socket."""
         print("[VIDEO CLIENT] Disconnecting...")
         self.running = False
         self.stop_camera()

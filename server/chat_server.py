@@ -178,23 +178,53 @@ class ChatServer:
 
 
     def _process_message(self, client_id, username, message):
+        # Handle reaction messages
+        if message.get('type') == 'reaction':
+            emoji = message.get('emoji', '')
+            if emoji:
+                reaction_obj = {
+                    'type': 'reaction',
+                    'client_id': client_id,
+                    'username': username,
+                    'emoji': emoji,
+                    'timestamp': datetime.now().isoformat()
+                }
+                print(f"[CHAT] Reaction from {username}: {emoji}")
+                self._broadcast_message(reaction_obj)
+            return
+        
         text = message.get('text', '').strip()
         if not text: return # Ignore empty messages
+
+        recipient_id = message.get('recipient_id')
+        is_private = message.get('is_private', False) or (recipient_id is not None)
 
         msg_obj = {
             'type': 'message', 'client_id': client_id, 'username': username,
             'text': text[:512], # Limit message length
             'timestamp': datetime.now().isoformat()
         }
-        with self.history_lock:
-            self.message_history.append(msg_obj)
-            # Trim history occasionally
-            if len(self.message_history) > 200:
-                 self.message_history = self.message_history[-150:]
+        
+        # Add private message fields if it's a private message
+        if is_private and recipient_id is not None:
+            msg_obj['is_private'] = True
+            msg_obj['recipient_id'] = recipient_id
+            msg_obj['sender_id'] = client_id
+            # Only add to history for sender and recipient (we'll handle separately)
+            print(f"[CHAT] Private message from {username} to client {recipient_id}: {msg_obj['text']}")
+            # Send to recipient and sender only
+            self._send_private_message(msg_obj, recipient_id, client_id)
+        else:
+            # Public message - broadcast to all
+            with self.history_lock:
+                self.message_history.append(msg_obj)
+                # Trim history occasionally
+                if len(self.message_history) > 200:
+                     self.message_history = self.message_history[-150:]
 
-        self.total_messages += 1
-        print(f"[CHAT] {username}: {msg_obj['text']}")
-        self._broadcast_message(msg_obj)
+            self.total_messages += 1
+            print(f"[CHAT] {username}: {msg_obj['text']}")
+            self._broadcast_message(msg_obj)
 
 
     def _send_message_to_socket(self, sock, msg_obj):
@@ -211,6 +241,35 @@ class ChatServer:
              print(f"[CHAT SERVER WARN] Unexpected error sending message: {e}")
              return False
 
+
+    def _send_private_message(self, msg_obj, recipient_id, sender_id):
+        """Sends a private message to the recipient and sender only."""
+        disconnected_clients = []
+        with self.client_lock:
+            # Get recipient and sender sockets
+            recipient_info = self.clients.get(recipient_id)
+            sender_info = self.clients.get(sender_id)
+            
+            # Send to recipient
+            if recipient_info:
+                if not self._send_message_to_socket(recipient_info['socket'], msg_obj):
+                    disconnected_clients.append(recipient_id)
+            
+            # Send to sender (so they see their own private message)
+            if sender_info and sender_id != recipient_id:
+                if not self._send_message_to_socket(sender_info['socket'], msg_obj):
+                    disconnected_clients.append(sender_id)
+            
+            # Cleanup disconnected clients
+            if disconnected_clients:
+                for cid in disconnected_clients:
+                    if cid in self.clients:
+                        print(f"[CHAT SERVER INFO] Client {cid} disconnected during private message send.")
+                        try: self.clients[cid]['socket'].close()
+                        except: pass
+                        del self.clients[cid]
+                # Update user list if someone disconnected
+                self._broadcast_user_list()
 
     def _broadcast_message(self, msg_obj, exclude_client_id=None):
         """Broadcasts a message object to all connected clients except excluded."""
